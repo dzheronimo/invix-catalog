@@ -1,0 +1,84 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-catalog}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-catalog}
+      POSTGRES_DB: ${POSTGRES_DB:-catalog}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+
+  # pgsty/silo is the MinIO Community fork: the original minio/minio image was
+  # removed from Docker Hub in September 2026 and quay.io requires a login.
+  minio:
+    image: pgsty/silo:RELEASE.2026-10-18T00-00-00Z
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${S3_ACCESS_KEY:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${S3_SECRET_KEY:-minioadmin}
+    volumes:
+      - miniodata:/data
+
+  backend:
+    build: ./backend
+    environment:
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-catalog}:${POSTGRES_PASSWORD:-catalog}@postgres:5432/${POSTGRES_DB:-catalog}
+      S3_ENDPOINT: http://minio:9000
+      S3_ACCESS_KEY: ${S3_ACCESS_KEY:-minioadmin}
+      S3_SECRET_KEY: ${S3_SECRET_KEY:-minioadmin}
+      S3_BUCKET: ${S3_BUCKET:-catalog-images}
+      INTERNAL_TOKEN: ${INTERNAL_TOKEN:-dev-internal-token}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      # Bucket creation is retried by the backend itself on startup.
+      minio:
+        condition: service_started
+    deploy:
+      replicas: 2
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/api/healthz')"]
+      interval: 10s
+      timeout: 3s
+      retries: 6
+
+  bot:
+    build: ./bot
+    environment:
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:?set TELEGRAM_BOT_TOKEN in .env}
+      TELEGRAM_ADMIN_IDS: ${TELEGRAM_ADMIN_IDS:-}
+      BACKEND_URL: http://backend:8000
+      INTERNAL_TOKEN: ${INTERNAL_TOKEN:-dev-internal-token}
+      MINI_APP_URL: ${MINI_APP_URL:-http://localhost:8080/}
+    depends_on:
+      - backend
+    deploy:
+      replicas: 2
+
+  frontend:
+    build: ./frontend
+    environment:
+      API_INTERNAL_URL: http://backend:8000
+    depends_on:
+      - backend
+    deploy:
+      replicas: 2
+
+  nginx:
+    image: nginx:1.27-alpine
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+    ports:
+      - "${HTTP_PORT:-8080}:80"
+    depends_on:
+      - backend
+      - frontend
+
+volumes:
+  pgdata:
+  miniodata:
